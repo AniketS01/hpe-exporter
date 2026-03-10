@@ -2,11 +2,11 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"log/slog"
+	"os"
 	"strings"
 	"sync"
 
-	"github.com/prometheus/common/log"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -23,7 +23,8 @@ type Config struct {
 // SafeConfig wraps Config for concurrency-safe operations.
 type SafeConfig struct {
 	sync.RWMutex
-	C *Config
+	C      *Config
+	logger *slog.Logger
 }
 
 // Credentials is the Go representation of the credentials section in the yaml
@@ -76,14 +77,14 @@ func (s *Credentials) UnmarshalYAML(unmarshal func(interface{}) error) error {
 func (sc *SafeConfig) ReloadConfig(configFile string) error {
 	var c = &Config{}
 
-	yamlFile, err := ioutil.ReadFile(configFile)
+	yamlFile, err := os.ReadFile(configFile)
 	if err != nil {
-		log.Errorf("Error reading config file: %s", err)
+		sc.logger.Error(fmt.Sprintf("Error reading config file: %s", err))
 		return err
 	}
 
 	if err := yaml.Unmarshal(yamlFile, c); err != nil {
-		log.Errorf("Error parsing config file: %s", err)
+		sc.logger.Error(fmt.Sprintf("Error parsing config file: %s", err))
 		return err
 	}
 
@@ -91,7 +92,7 @@ func (sc *SafeConfig) ReloadConfig(configFile string) error {
 	sc.C = c
 	sc.Unlock()
 
-	log.Infoln("Loaded config file")
+	sc.logger.Info("Loaded config file")
 	return nil
 }
 

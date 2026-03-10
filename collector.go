@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"os/exec"
@@ -18,7 +19,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/log"
 )
 
 const (
@@ -35,6 +35,7 @@ var (
 type collector struct {
 	target string
 	config *SafeConfig
+	logger *slog.Logger
 }
 
 type sensorData struct {
@@ -182,7 +183,7 @@ password %s
 	`, driver, user, password)
 }
 
-func freeipmiConfigPipe(driver, user, password string) (string, error) {
+func freeipmiConfigPipe(driver, user, password string, logger *slog.Logger) (string, error) {
 	content := []byte(freeipmiConfig(driver, user, password))
 	pipe := pipeName()
 	err := syscall.Mkfifo(pipe, 0600)
@@ -193,21 +194,21 @@ func freeipmiConfigPipe(driver, user, password string) (string, error) {
 	go func(file string, data []byte) {
 		f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_APPEND, os.ModeNamedPipe)
 		if err != nil {
-			log.Errorf("Error opening pipe: %s", err)
+			logger.Error(fmt.Sprintf("Error opening pipe: %s", err))
 		}
 		if _, err := f.Write(data); err != nil {
-			log.Errorf("Error writing config to pipe: %s", err)
+			logger.Error(fmt.Sprintf("Error writing config to pipe: %s", err))
 		}
 		f.Close()
 	}(pipe, content)
 	return pipe, nil
 }
 
-func freeipmiOutput(cmd string, rmcp *rmcpConfig, arg ...string) ([]byte, error) {
+func freeipmiOutput(cmd string, rmcp *rmcpConfig, logger *slog.Logger, arg ...string) ([]byte, error) {
 	args := []string{}
 
 	if rmcp != nil {
-		pipe, err := freeipmiConfigPipe("LAN_2_0", rmcp.user, rmcp.pass)
+		pipe, err := freeipmiConfigPipe("LAN_2_0", rmcp.user, rmcp.pass, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -224,21 +225,21 @@ func freeipmiOutput(cmd string, rmcp *rmcpConfig, arg ...string) ([]byte, error)
 	args = append(args, arg...)
 	out, err := exec.Command(fqcmd, args...).CombinedOutput()
 	if err != nil {
-		log.Errorf("Error while calling %s: %s", cmd, out)
+		logger.Error(fmt.Sprintf("Error while calling %s: %s", cmd, out))
 	}
 	return out, err
 }
 
-func ipmiMonitoringOutput(rmcp *rmcpConfig) ([]byte, error) {
-	return freeipmiOutput("ipmimonitoring", rmcp, "-Q", "--comma-separated-output", "--no-header-output", "--sdr-cache-recreate")
+func ipmiMonitoringOutput(rmcp *rmcpConfig, logger *slog.Logger) ([]byte, error) {
+	return freeipmiOutput("ipmimonitoring", rmcp, logger, "-Q", "--comma-separated-output", "--no-header-output", "--sdr-cache-recreate")
 }
 
-func ipmiDCMIOutput(rmcp *rmcpConfig) ([]byte, error) {
-	return freeipmiOutput("ipmi-dcmi", rmcp, "--get-system-power-statistics")
+func ipmiDCMIOutput(rmcp *rmcpConfig, logger *slog.Logger) ([]byte, error) {
+	return freeipmiOutput("ipmi-dcmi", rmcp, logger, "--get-system-power-statistics")
 }
 
-func bmcInfoOutput(rmcp *rmcpConfig) ([]byte, error) {
-	return freeipmiOutput("bmc-info", rmcp, "--get-device-id")
+func bmcInfoOutput(rmcp *rmcpConfig, logger *slog.Logger) ([]byte, error) {
+	return freeipmiOutput("bmc-info", rmcp, logger, "--get-device-id")
 }
 
 func splitMonitoringOutput(impiOutput []byte, excludeSensorIds []int64) ([]sensorData, error) {
@@ -364,15 +365,15 @@ func collectGenericSensor(ch chan<- prometheus.Metric, state float64, data senso
 }
 
 func (c collector) collectMonitoring(ch chan<- prometheus.Metric, rmcp *rmcpConfig) (int, error) {
-	output, err := ipmiMonitoringOutput(rmcp)
+	output, err := ipmiMonitoringOutput(rmcp, c.logger)
 	if err != nil {
-		log.Errorf("Failed to collect ipmimonitoring data: %s", err)
+		c.logger.Error(fmt.Sprintf("Failed to collect ipmimonitoring data: %s", err))
 		return 0, err
 	}
 	excludeIds := c.config.ExcludeSensorIDs()
 	results, err := splitMonitoringOutput(output, excludeIds)
 	if err != nil {
-		log.Errorf("Failed to parse ipmimonitoring data: %s", err)
+		c.logger.Error(fmt.Sprintf("Failed to parse ipmimonitoring data: %s", err))
 		return 0, err
 	}
 	for _, data := range results {
@@ -388,11 +389,11 @@ func (c collector) collectMonitoring(ch chan<- prometheus.Metric, rmcp *rmcpConf
 		case "N/A":
 			state = math.NaN()
 		default:
-			log.Errorf("Unknown sensor state: '%s'\n", data.State)
+			c.logger.Error(fmt.Sprintf("Unknown sensor state: '%s'", data.State))
 			state = math.NaN()
 		}
 
-		log.Debugf("Got values: %v\n", data)
+		c.logger.Debug(fmt.Sprintf("Got values: %v", data))
 
 		switch data.Unit {
 		case "RPM":
@@ -413,14 +414,14 @@ func (c collector) collectMonitoring(ch chan<- prometheus.Metric, rmcp *rmcpConf
 }
 
 func (c collector) collectDCMI(ch chan<- prometheus.Metric, rmcp *rmcpConfig) (int, error) {
-	output, err := ipmiDCMIOutput(rmcp)
+	output, err := ipmiDCMIOutput(rmcp, c.logger)
 	if err != nil {
-		log.Debugf("Failed to collect ipmi-dcmi data: %s", err)
+		c.logger.Debug(fmt.Sprintf("Failed to collect ipmi-dcmi data: %s", err))
 		return 0, err
 	}
 	currentPowerConsumption, err := getCurrentPowerConsumption(output)
 	if err != nil {
-		log.Errorf("Failed to parse ipmi-dcmi data: %s", err)
+		c.logger.Error(fmt.Sprintf("Failed to parse ipmi-dcmi data: %s", err))
 		return 0, err
 	}
 	ch <- prometheus.MustNewConstMetric(
@@ -432,19 +433,19 @@ func (c collector) collectDCMI(ch chan<- prometheus.Metric, rmcp *rmcpConfig) (i
 }
 
 func (c collector) collectBmcInfo(ch chan<- prometheus.Metric, rmcp *rmcpConfig) (int, error) {
-	output, err := bmcInfoOutput(rmcp)
+	output, err := bmcInfoOutput(rmcp, c.logger)
 	if err != nil {
-		log.Debugf("Failed to collect bmc-info data: %s", err)
+		c.logger.Debug(fmt.Sprintf("Failed to collect bmc-info data: %s", err))
 		return 0, err
 	}
 	firmwareRevision, err := getBMCInfoFirmwareRevision(output)
 	if err != nil {
-		log.Errorf("Failed to parse bmc-info data: %s", err)
+		c.logger.Error(fmt.Sprintf("Failed to parse bmc-info data: %s", err))
 		return 0, err
 	}
 	manufacturerID, err := getBMCInfoManufacturerID(output)
 	if err != nil {
-		log.Errorf("Failed to parse bmc-info data: %s", err)
+		c.logger.Error(fmt.Sprintf("Failed to parse bmc-info data: %s", err))
 		return 0, err
 	}
 	ch <- prometheus.MustNewConstMetric(
@@ -482,7 +483,7 @@ func (c collector) Collect(ch chan<- prometheus.Metric) {
 	start := time.Now()
 	defer func() {
 		duration := time.Since(start).Seconds()
-		log.Debugf("Scrape of target %s took %f seconds.", targetName(c.target), duration)
+		c.logger.Debug(fmt.Sprintf("Scrape of target %s took %f seconds.", targetName(c.target), duration))
 		ch <- prometheus.MustNewConstMetric(
 			durationDesc,
 			prometheus.GaugeValue,
@@ -495,7 +496,7 @@ func (c collector) Collect(ch chan<- prometheus.Metric) {
 	if !targetIsLocal(c.target) {
 		creds, err := c.config.CredentialsForTarget(c.target)
 		if err != nil {
-			log.Errorf("No credentials available for target %s.", c.target)
+			c.logger.Error(fmt.Sprintf("No credentials available for target %s.", c.target))
 			c.markCollectorsUp(ch, 0, 0, 0)
 			return
 		}
