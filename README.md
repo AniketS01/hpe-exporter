@@ -18,7 +18,7 @@ implementation.
 You need a Go development environment. Then, run the following to get the
 source code and build and install the binary:
 
-    go get github.com/pyguy/hpe-exporter
+    go install github.com/pyguy/hpe-exporter@latest
 
 ## Running
 
